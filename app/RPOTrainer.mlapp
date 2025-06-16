@@ -1,0 +1,422 @@
+classdef RPOTrainer < matlab.apps.AppBase
+
+    % Properties that correspond to app components
+    properties (Access = public)
+        UIFigure           matlab.ui.Figure
+        MainGrid           matlab.ui.container.GridLayout
+        OrbitPanel         matlab.ui.container.Panel
+        OrbitAxes          matlab.ui.control.UIAxes
+        ControlPanel       matlab.ui.container.Panel
+        WaypointTable      matlab.ui.control.Table
+        DeltaVGauge        matlab.ui.control.Lamp
+        TimeSlider         matlab.ui.control.Slider
+        AddWPButton        matlab.ui.control.Button
+        RunSimButton       matlab.ui.control.Button
+        ResetButton        matlab.ui.control.Button
+        QuizButton         matlab.ui.control.Button
+        NarrativePanel     matlab.ui.container.Panel
+        NarrativeText      matlab.ui.control.HTML
+        % New components
+        ViewControlsPanel  matlab.ui.container.Panel
+        ShowTrajectoryButton matlab.ui.control.Button
+        ShowRICFrameButton matlab.ui.control.Button
+        ShowSafetyZonesButton matlab.ui.control.Button
+        SpeedControl       matlab.ui.control.Spinner
+        LessonProgressBar  matlab.ui.control.ProgressBar
+        NextLessonButton   matlab.ui.control.Button
+        PreviousLessonButton matlab.ui.control.Button
+        StationKeepSwitch  matlab.ui.control.Switch
+        StationKeepLabel   matlab.ui.control.Label
+    end
+
+    % Properties that correspond to app data
+    properties (Access = private)
+        % Solar system bodies
+        Sun
+        Earth
+        Moon
+        ChiefSatellite
+        DeputySatellite
+        
+        % Visualization elements
+        TrajectoryLine
+        RICFrame
+        SafetyZones
+        TrajectoryHistory
+        
+        % Simulation parameters
+        CurrentTime = 0
+        TimeStep = 60  % seconds
+        MeanMotion = 0.0011  % rad/s for LEO
+        SimulationSpeed = 1
+        
+        % Controller
+        Controller
+        
+        % Lesson data
+        CurrentLesson = 1
+        LessonData
+        TotalLessons = 11
+    end
+
+    % Callbacks that handle component events
+    methods (Access = private)
+
+        % Code that executes after component creation
+        function startupFcn(app)
+            % Initialize the 3D visualization
+            initializeVisualization(app);
+            
+            % Initialize controller
+            app.Controller = rpoController(app.MeanMotion);
+            
+            % Load first lesson
+            loadLesson(app, 1);
+            
+            % Initialize trajectory history
+            app.TrajectoryHistory = zeros(3, 1000);
+            app.TrajectoryHistoryIndex = 1;
+        end
+
+        % Initialize 3D visualization
+        function initializeVisualization(app)
+            % Set up the axes
+            ax = app.OrbitAxes;
+            hold(ax, 'on');
+            grid(ax, 'on');
+            axis(ax, 'equal');
+            view(ax, 45, 30);
+            
+            % Create Sun with glow effect
+            [X,Y,Z] = sphere(50);
+            app.Sun = surf(ax, X*696340, Y*696340, Z*696340, 'FaceColor', 'yellow', 'EdgeColor', 'none');
+            alpha(app.Sun, 0.8);
+            
+            % Create Earth with texture
+            app.Earth = surf(ax, X*6371, Y*6371, Z*6371, 'FaceColor', 'blue', 'EdgeColor', 'none');
+            
+            % Create Moon with texture
+            app.Moon = surf(ax, X*1737, Y*1737, Z*1737, 'FaceColor', [0.7 0.7 0.7], 'EdgeColor', 'none');
+            
+            % Create Chief Satellite with orbit line
+            app.ChiefSatellite = plot3(ax, 0, 0, 0, 'ro', 'MarkerSize', 10, 'MarkerFaceColor', 'r');
+            
+            % Create Deputy Satellite with orbit line
+            app.DeputySatellite = plot3(ax, 0, 0, 0, 'bo', 'MarkerSize', 8, 'MarkerFaceColor', 'b');
+            
+            % Create trajectory line
+            app.TrajectoryLine = plot3(ax, 0, 0, 0, 'b-', 'LineWidth', 1, 'Visible', 'off');
+            
+            % Create RIC frame
+            app.RICFrame = quiver3(ax, 0, 0, 0, 0, 0, 0, 'r-', 'LineWidth', 2, 'Visible', 'off');
+            
+            % Create safety zones
+            [X,Y,Z] = sphere(20);
+            app.SafetyZones = surf(ax, X*500, Y*500, Z*500, 'FaceColor', 'red', 'EdgeColor', 'none', 'FaceAlpha', 0.1, 'Visible', 'off');
+            
+            % Set up lighting
+            light(ax, 'Position', [1 0 0], 'Style', 'infinite');
+            lighting(ax, 'gouraud');
+            
+            % Set axis limits
+            axis(ax, [-10000 10000 -10000 10000 -10000 10000]);
+            xlabel(ax, 'X (km)');
+            ylabel(ax, 'Y (km)');
+            zlabel(ax, 'Z (km)');
+            title(ax, 'RPO Visualization');
+        end
+
+        % Load lesson data
+        function loadLesson(app, lessonNumber)
+            % Load lesson data from scenarios folder
+            lessonFile = fullfile('scenarios', sprintf('lesson_%d.mat', lessonNumber));
+            if exist(lessonFile, 'file')
+                load(lessonFile, 'LessonData');
+                app.LessonData = LessonData;
+                
+                % Update narrative
+                app.NarrativeText.HTMLSource = LessonData.narrative;
+                
+                % Update waypoint table
+                app.WaypointTable.Data = LessonData.waypoints;
+                
+                % Update lesson progress
+                app.LessonProgressBar.Value = (lessonNumber / app.TotalLessons) * 100;
+                
+                % Reset simulation
+                resetSimulation(app);
+            end
+        end
+
+        % Reset simulation
+        function resetSimulation(app)
+            app.CurrentTime = 0;
+            app.TimeSlider.Value = 0;
+            app.TrajectoryHistoryIndex = 1;
+            set(app.TrajectoryLine, 'XData', [], 'YData', [], 'ZData', []);
+            updateVisualization(app);
+        end
+
+        % Update visualization
+        function updateVisualization(app)
+            % Update satellite positions
+            if ~isempty(app.LessonData)
+                % Get current state
+                state = app.LessonData.initialState;
+                
+                % Update deputy satellite position
+                set(app.DeputySatellite, 'XData', state(1), 'YData', state(2), 'ZData', state(3));
+                
+                % Update chief satellite position (stationary in this frame)
+                set(app.ChiefSatellite, 'XData', 0, 'YData', 0, 'ZData', 0);
+                
+                % Update trajectory history
+                app.TrajectoryHistory(:, app.TrajectoryHistoryIndex) = state(1:3);
+                app.TrajectoryHistoryIndex = app.TrajectoryHistoryIndex + 1;
+                
+                % Update trajectory line if visible
+                if strcmp(app.TrajectoryLine.Visible, 'on')
+                    set(app.TrajectoryLine, 'XData', app.TrajectoryHistory(1,1:app.TrajectoryHistoryIndex-1), ...
+                        'YData', app.TrajectoryHistory(2,1:app.TrajectoryHistoryIndex-1), ...
+                        'ZData', app.TrajectoryHistory(3,1:app.TrajectoryHistoryIndex-1));
+                end
+                
+                % Update RIC frame if visible
+                if strcmp(app.RICFrame.Visible, 'on')
+                    set(app.RICFrame, 'XData', 0, 'YData', 0, 'ZData', 0, ...
+                        'UData', [1000 0 0], 'VData', [0 1000 0], 'WData', [0 0 1000]);
+                end
+            end
+        end
+
+        % Button pushed function: RunSimButton
+        function RunSimButtonPushed(app, event)
+            % Start simulation
+            while app.CurrentTime < app.TimeSlider.Limits(2)
+                % Update time
+                app.CurrentTime = app.CurrentTime + app.TimeStep;
+                app.TimeSlider.Value = app.CurrentTime;
+                
+                % Update visualization
+                updateVisualization(app);
+                
+                % Force update
+                drawnow;
+                
+                % Add delay based on simulation speed
+                pause(0.1 / app.SimulationSpeed);
+            end
+        end
+
+        % Value changed function: TimeSlider
+        function TimeSliderValueChanged(app, event)
+            app.CurrentTime = app.TimeSlider.Value;
+            updateVisualization(app);
+        end
+
+        % Button pushed function: ShowTrajectoryButton
+        function ShowTrajectoryButtonPushed(app, event)
+            if strcmp(app.TrajectoryLine.Visible, 'off')
+                app.TrajectoryLine.Visible = 'on';
+                app.ShowTrajectoryButton.Text = 'Hide Trajectory';
+            else
+                app.TrajectoryLine.Visible = 'off';
+                app.ShowTrajectoryButton.Text = 'Show Trajectory';
+            end
+        end
+
+        % Button pushed function: ShowRICFrameButton
+        function ShowRICFrameButtonPushed(app, event)
+            if strcmp(app.RICFrame.Visible, 'off')
+                app.RICFrame.Visible = 'on';
+                app.ShowRICFrameButton.Text = 'Hide RIC Frame';
+            else
+                app.RICFrame.Visible = 'off';
+                app.ShowRICFrameButton.Text = 'Show RIC Frame';
+            end
+        end
+
+        % Button pushed function: ShowSafetyZonesButton
+        function ShowSafetyZonesButtonPushed(app, event)
+            if strcmp(app.SafetyZones.Visible, 'off')
+                app.SafetyZones.Visible = 'on';
+                app.ShowSafetyZonesButton.Text = 'Hide Safety Zones';
+            else
+                app.SafetyZones.Visible = 'off';
+                app.ShowSafetyZonesButton.Text = 'Show Safety Zones';
+            end
+        end
+
+        % Value changed function: SpeedControl
+        function SpeedControlValueChanged(app, event)
+            app.SimulationSpeed = app.SpeedControl.Value;
+        end
+
+        % Button pushed function: NextLessonButton
+        function NextLessonButtonPushed(app, event)
+            if app.CurrentLesson < app.TotalLessons
+                app.CurrentLesson = app.CurrentLesson + 1;
+                loadLesson(app, app.CurrentLesson);
+            end
+        end
+
+        % Button pushed function: PreviousLessonButton
+        function PreviousLessonButtonPushed(app, event)
+            if app.CurrentLesson > 1
+                app.CurrentLesson = app.CurrentLesson - 1;
+                loadLesson(app, app.CurrentLesson);
+            end
+        end
+
+        % Value changed function: StationKeepSwitch
+        function StationKeepSwitchValueChanged(app, event)
+            app.Controller.enableStationKeeping(app.StationKeepSwitch.Value);
+        end
+    end
+
+    % Component initialization
+    methods (Access = private)
+
+        % Create UI components
+        function createComponents(app)
+            % Create UIFigure
+            app.UIFigure = uifigure('Visible', 'off');
+            app.UIFigure.Position = [100, 100, 1200, 800];
+            app.UIFigure.Name = 'RPO Trainer';
+
+            % Create MainGrid
+            app.MainGrid = uigridlayout(app.UIFigure);
+            app.MainGrid.ColumnWidth = {'1x', '1x'};
+            app.MainGrid.RowHeight = {'1x', '1x'};
+
+            % Create OrbitPanel
+            app.OrbitPanel = uipanel(app.MainGrid);
+            app.OrbitPanel.Layout.Row = [1 2];
+            app.OrbitPanel.Layout.Column = 1;
+            app.OrbitPanel.Title = 'Orbit Visualization';
+
+            % Create OrbitAxes
+            app.OrbitAxes = uiaxes(app.OrbitPanel);
+            app.OrbitAxes.Position = [10, 10, 580, 380];
+
+            % Create ViewControlsPanel
+            app.ViewControlsPanel = uipanel(app.OrbitPanel);
+            app.ViewControlsPanel.Position = [10, 400, 580, 100];
+            app.ViewControlsPanel.Title = 'View Controls';
+
+            % Create view control buttons
+            app.ShowTrajectoryButton = uibutton(app.ViewControlsPanel, 'push');
+            app.ShowTrajectoryButton.Position = [10, 10, 120, 22];
+            app.ShowTrajectoryButton.Text = 'Show Trajectory';
+
+            app.ShowRICFrameButton = uibutton(app.ViewControlsPanel, 'push');
+            app.ShowRICFrameButton.Position = [140, 10, 120, 22];
+            app.ShowRICFrameButton.Text = 'Show RIC Frame';
+
+            app.ShowSafetyZonesButton = uibutton(app.ViewControlsPanel, 'push');
+            app.ShowSafetyZonesButton.Position = [270, 10, 120, 22];
+            app.ShowSafetyZonesButton.Text = 'Show Safety Zones';
+
+            % Create speed control
+            app.SpeedControl = uispinner(app.ViewControlsPanel);
+            app.SpeedControl.Position = [400, 10, 100, 22];
+            app.SpeedControl.Limits = [0.1 10];
+            app.SpeedControl.Value = 1;
+            app.SpeedControl.Step = 0.1;
+            app.SpeedControl.ValueDisplayFormat = '%.1fx';
+
+            % Create ControlPanel
+            app.ControlPanel = uipanel(app.MainGrid);
+            app.ControlPanel.Layout.Row = 2;
+            app.ControlPanel.Layout.Column = 2;
+            app.ControlPanel.Title = 'Controls';
+
+            % Create WaypointTable
+            app.WaypointTable = uitable(app.ControlPanel);
+            app.WaypointTable.ColumnName = {'X', 'Y', 'Z', 'Time'};
+            app.WaypointTable.Position = [10, 10, 580, 150];
+
+            % Create DeltaVGauge
+            app.DeltaVGauge = uilamp(app.ControlPanel);
+            app.DeltaVGauge.Position = [10, 170, 20, 20];
+            app.DeltaVGauge.Color = 'green';
+
+            % Create TimeSlider
+            app.TimeSlider = uislider(app.ControlPanel);
+            app.TimeSlider.Limits = [0 3600];
+            app.TimeSlider.Position = [10, 200, 580, 3];
+
+            % Create Buttons
+            app.AddWPButton = uibutton(app.ControlPanel, 'push');
+            app.AddWPButton.Position = [10, 220, 100, 22];
+            app.AddWPButton.Text = 'Add Waypoint';
+
+            app.RunSimButton = uibutton(app.ControlPanel, 'push');
+            app.RunSimButton.Position = [120, 220, 100, 22];
+            app.RunSimButton.Text = 'Run Simulation';
+
+            app.ResetButton = uibutton(app.ControlPanel, 'push');
+            app.ResetButton.Position = [230, 220, 100, 22];
+            app.ResetButton.Text = 'Reset';
+
+            app.QuizButton = uibutton(app.ControlPanel, 'push');
+            app.QuizButton.Position = [340, 220, 100, 22];
+            app.QuizButton.Text = 'Quiz';
+
+            % Create station keeping switch
+            app.StationKeepSwitch = uiswitch(app.ControlPanel, 'slider');
+            app.StationKeepSwitch.Position = [460, 220, 45, 20];
+
+            app.StationKeepLabel = uilabel(app.ControlPanel);
+            app.StationKeepLabel.Position = [510, 220, 80, 22];
+            app.StationKeepLabel.Text = 'Station Keep';
+
+            % Create NarrativePanel
+            app.NarrativePanel = uipanel(app.MainGrid);
+            app.NarrativePanel.Layout.Row = 1;
+            app.NarrativePanel.Layout.Column = 2;
+            app.NarrativePanel.Title = 'Lesson Narrative';
+
+            % Create NarrativeText
+            app.NarrativeText = uihtml(app.NarrativePanel);
+            app.NarrativeText.Position = [10, 10, 580, 380];
+
+            % Create lesson navigation
+            app.PreviousLessonButton = uibutton(app.NarrativePanel, 'push');
+            app.PreviousLessonButton.Position = [10, 400, 100, 22];
+            app.PreviousLessonButton.Text = 'Previous Lesson';
+
+            app.NextLessonButton = uibutton(app.NarrativePanel, 'push');
+            app.NextLessonButton.Position = [470, 400, 100, 22];
+            app.NextLessonButton.Text = 'Next Lesson';
+
+            app.LessonProgressBar = uiprogressbar(app.NarrativePanel);
+            app.LessonProgressBar.Position = [120, 410, 340, 10];
+
+            % Show the figure after all components are created
+            app.UIFigure.Visible = 'on';
+        end
+    end
+
+    % App creation and deletion
+    methods (Access = public)
+
+        % Construct app
+        function app = RPOTrainer
+            % Create UI components
+            createComponents(app)
+
+            % Register the app with App Designer
+            registerApp(app, app.UIFigure)
+
+            % Execute the startup function
+            runStartupFcn(app, @startupFcn)
+        end
+
+        % Code that executes before app deletion
+        function delete(app)
+            % Delete UIFigure when app is deleted
+            delete(app.UIFigure)
+        end
+    end
+end 

@@ -1,0 +1,6 @@
+*.asv 
+*.m~ 
+*.slxc 
+thumbs.db 
+*.autosave 
+.DS_Store 
